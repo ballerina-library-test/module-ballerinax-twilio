@@ -43,11 +43,8 @@ jobs:
         run: |
           cd scripts
           
-          # Read the diff content and pass it as an argument
-          DIFF_CONTENT=$(cat ../git_diff.txt)
-          
-          # Run the Ballerina script with the diff content
-          bal run analyze_version_change.bal -- "$DIFF_CONTENT"
+          # Run the Ballerina script with the diff file path
+          bal run analyze_version_change.bal -- "../git_diff.txt"
           
           mv analysis_result.json ../
       

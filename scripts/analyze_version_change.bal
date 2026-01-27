@@ -124,9 +124,12 @@ Analyze the diff and respond with ONLY a JSON object (no markdown, no explanatio
     return check value:fromJsonStringWithType(text.trim());
 }
 
-public function main(string gitDiffContent) returns error? {
+public function main(string diffFilePath) returns error? {
     
     io:println("📊 Analyzing git diff...");
+    io:println(string `📂 Reading diff from: ${diffFilePath}`);
+    
+    string gitDiffContent = check io:fileReadString(diffFilePath);
     io:println(string `📏 Diff size: ${gitDiffContent.length()} chars`);
     
     if gitDiffContent.length() == 0 {
