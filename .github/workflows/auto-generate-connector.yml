@@ -16,3 +16,4 @@ jobs:
       distribution-zip: ""
       license-file: "license.txt"
       quiet-mode: true
+      skip-to-doc: true
