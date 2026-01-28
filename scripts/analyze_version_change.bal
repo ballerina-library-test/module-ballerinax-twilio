@@ -8,6 +8,8 @@ import ballerina/regex;
 const string ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 const int MAX_RETRIES = 2;
 const decimal RETRY_DELAY_SECONDS = 3.0;
+// Max characters to send to API (~4 chars per token, limit to ~150K tokens worth)
+const int MAX_DIFF_CHARS = 600000;
 
 type AnalysisResult record {
     string changeType;
@@ -136,6 +138,13 @@ public function main(string diffFilePath) returns error? {
         return error("Git diff content is empty");
     }
     
+    // Truncate if diff is too large for API context limit
+    if gitDiffContent.length() > MAX_DIFF_CHARS {
+        io:println(string `⚠️ Diff too large, truncating to ${MAX_DIFF_CHARS} chars...`);
+        gitDiffContent = truncateDiff(gitDiffContent, MAX_DIFF_CHARS);
+        io:println(string `📏 Truncated diff size: ${gitDiffContent.length()} chars`);
+    }
+    
     io:println("🤖 Analyzing with Claude...");
     
     AnalysisResult analysis = check analyzeWithAnthropic(gitDiffContent);
@@ -185,4 +194,55 @@ function repeatString(string s, int n) returns string {
         result = result + s;
     }
     return result;
+}
+
+// Truncates the diff intelligently, trying to keep complete hunks
+function truncateDiff(string diff, int maxChars) returns string {
+    if diff.length() <= maxChars {
+        return diff;
+    }
+    
+    // Reserve space for truncation notice
+    int reservedChars = 200;
+    int targetLength = maxChars - reservedChars;
+    
+    // Try to find a good breakpoint (end of a diff hunk)
+    string truncated = diff.substring(0, targetLength);
+    
+    // Look for the last complete hunk marker (@@) or newline
+    int? lastHunkMarker = findLastIndexOf(truncated, "\n@@");
+    int? lastNewline = findLastIndexOf(truncated, "\n");
+    
+    int breakpoint = targetLength;
+    if lastHunkMarker is int && lastHunkMarker > targetLength / 2 {
+        // Break at the last hunk marker if it's in the second half
+        breakpoint = lastHunkMarker;
+    } else if lastNewline is int {
+        // Otherwise break at the last newline
+        breakpoint = lastNewline;
+    }
+    
+    string result = diff.substring(0, breakpoint);
+    string notice = string `
+
+... [TRUNCATED: Diff was ${diff.length()} chars, showing first ${breakpoint} chars. Analysis based on partial diff - confidence may be lower for very large changes.] ...`;
+    
+    return result + notice;
+}
+
+function findLastIndexOf(string s, string substr) returns int? {
+    int lastIndex = -1;
+    int searchFrom = 0;
+    
+    while true {
+        int? idx = s.indexOf(substr, searchFrom);
+        if idx is int {
+            lastIndex = idx;
+            searchFrom = idx + 1;
+        } else {
+            break;
+        }
+    }
+    
+    return lastIndex >= 0 ? lastIndex : ();
 }
