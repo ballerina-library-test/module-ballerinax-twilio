@@ -16,74 +16,132 @@ jobs:
         with:
           fetch-depth: 0
       
-      - name: Generate git diff
+      - name: Generate focused git diff
         id: diff
         run: |
-          # Get diff between master and auto-generate-connector branches
-          # Only include client.bal and types.bal files
-          git diff origin/master...origin/auto-generate-connector -- ballerina/client.bal ballerina/types.bal > git_diff.txt
+          echo "Generating diff between master and auto-generate-connector branches..."
+          
+          # Generate diff focusing on client.bal and types.bal
+          # --unified=3 gives 3 lines of context (default, but explicit)
+          # --ignore-all-space to reduce noise from formatting
+          git diff origin/master...origin/auto-generate-connector \
+            --unified=3 \
+            -- ballerina/client.bal ballerina/types.bal > git_diff.txt
           
           # Check if diff is not empty
           if [ ! -s git_diff.txt ]; then
-            echo "No changes detected in client.bal or types.bal"
+            echo "❌ No changes detected in client.bal or types.bal"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
             exit 1
           fi
           
-          echo "Diff generated successfully"
-          echo "Diff size: $(wc -c < git_diff.txt) bytes"
+          # Get diff statistics
+          DIFF_SIZE=$(wc -c < git_diff.txt)
+          DIFF_LINES=$(wc -l < git_diff.txt)
+          
+          echo "✅ Diff generated successfully"
+          echo "📏 Size: $DIFF_SIZE bytes ($DIFF_LINES lines)"
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "diff_size=$DIFF_SIZE" >> $GITHUB_OUTPUT
+          echo "diff_lines=$DIFF_LINES" >> $GITHUB_OUTPUT
+          
+          # Show first 50 lines as preview
+          echo ""
+          echo "📋 Diff Preview (first 50 lines):"
+          echo "================================"
+          head -n 50 git_diff.txt
+          echo "================================"
       
       - name: Set up Ballerina
+        if: steps.diff.outputs.has_changes == 'true'
         uses: ballerina-platform/setup-ballerina@v1.1.0
         with:
           version: latest
       
       - name: Run analysis
+        if: steps.diff.outputs.has_changes == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           cd scripts
           
+          echo "🤖 Starting version change analysis..."
+          echo "📊 Diff statistics:"
+          echo "   - Size: ${{ steps.diff.outputs.diff_size }} bytes"
+          echo "   - Lines: ${{ steps.diff.outputs.diff_lines }}"
+          
           # Run the Ballerina script with the diff file path
           bal run analyze_version_change.bal -- "../git_diff.txt"
           
+          # Move result to root for easier access
           mv analysis_result.json ../
       
       - name: Display results
-        if: always()
+        if: always() && steps.diff.outputs.has_changes == 'true'
         run: |
           if [ -f analysis_result.json ]; then
-            echo "Analysis Results:"
+            echo "📊 Analysis Results:"
+            echo "==================="
             cat analysis_result.json | jq '.'
+            
+            # Extract key information
+            CHANGE_TYPE=$(jq -r '.changeType' analysis_result.json)
+            CONFIDENCE=$(jq -r '.confidence' analysis_result.json)
+            
+            echo ""
+            echo "🔖 Recommended Version Bump: $CHANGE_TYPE"
+            echo "✅ Confidence Score: $CONFIDENCE"
+          else
+            echo "⚠️ No analysis result found"
           fi
       
       - name: Upload analysis results
+        if: steps.diff.outputs.has_changes == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: version-analysis
           path: |
             analysis_result.json
             git_diff.txt
+          retention-days: 30
       
-      - name: Comment on PR (if triggered by PR)
-        if: github.event_name == 'repository_dispatch'
+      - name: Create enhanced PR comment
+        if: github.event_name == 'repository_dispatch' && steps.diff.outputs.has_changes == 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             
             if (!fs.existsSync('analysis_result.json')) {
-              console.log('No analysis result found');
+              console.log('❌ No analysis result found');
               return;
             }
             
             const analysis = JSON.parse(fs.readFileSync('analysis_result.json', 'utf8'));
+            const diffSize = '${{ steps.diff.outputs.diff_size }}';
+            const diffLines = '${{ steps.diff.outputs.diff_lines }}';
             
-            let comment = `## 📊 Version Change Analysis\n\n`;
-            comment += `**Recommended Version Bump:** \`${analysis.changeType}\`\n`;
-            comment += `**Confidence:** ${analysis.confidence}\n\n`;
-            comment += `### Summary\n${analysis.summary}\n\n`;
+            // Determine emoji and color based on change type
+            const changeTypeEmoji = {
+              'MAJOR': '🔴',
+              'MINOR': '🟡', 
+              'PATCH': '🟢'
+            };
             
-            if (analysis.breakingChanges.length > 0) {
+            const emoji = changeTypeEmoji[analysis.changeType] || '⚪';
+            
+            // Build comment
+            let comment = `## ${emoji} Version Change Analysis\n\n`;
+            comment += `| Metric | Value |\n`;
+            comment += `|--------|-------|\n`;
+            comment += `| **Recommended Version Bump** | \`${analysis.changeType}\` |\n`;
+            comment += `| **Confidence Score** | ${(analysis.confidence * 100).toFixed(1)}% |\n`;
+            comment += `| **Diff Size** | ${diffSize} bytes (${diffLines} lines) |\n`;
+            comment += `\n`;
+            
+            comment += `### 📝 Summary\n${analysis.summary}\n\n`;
+            
+            if (analysis.breakingChanges && analysis.breakingChanges.length > 0) {
               comment += `### ⚠️ Breaking Changes\n`;
               analysis.breakingChanges.forEach(change => {
                 comment += `- ${change}\n`;
@@ -91,7 +149,7 @@ jobs:
               comment += '\n';
             }
             
-            if (analysis.newFeatures.length > 0) {
+            if (analysis.newFeatures && analysis.newFeatures.length > 0) {
               comment += `### ✨ New Features\n`;
               analysis.newFeatures.forEach(feature => {
                 comment += `- ${feature}\n`;
@@ -99,15 +157,26 @@ jobs:
               comment += '\n';
             }
             
-            if (analysis.bugFixes.length > 0) {
-              comment += `### 🐛 Improvements\n`;
+            if (analysis.bugFixes && analysis.bugFixes.length > 0) {
+              comment += `### 🐛 Bug Fixes & Improvements\n`;
               analysis.bugFixes.forEach(fix => {
                 comment += `- ${fix}\n`;
               });
+              comment += '\n';
             }
             
+            // Add interpretation guide
+            comment += `---\n`;
+            comment += `<details>\n`;
+            comment += `<summary>📚 Version Bump Guidelines</summary>\n\n`;
+            comment += `- **MAJOR (🔴)**: Breaking changes that require users to update their code\n`;
+            comment += `- **MINOR (🟡)**: New features added in a backward-compatible manner\n`;
+            comment += `- **PATCH (🟢)**: Bug fixes and improvements with no API changes\n`;
+            comment += `\n`;
+            comment += `*This analysis was performed using AI-powered diff analysis. Please review the changes manually before merging.*\n`;
+            comment += `</details>\n`;
+            
             // Post comment to PR
-            // You'll need to pass the PR number via repository_dispatch payload
             const prNumber = context.payload.client_payload?.pr_number;
             
             if (prNumber) {
@@ -117,4 +186,26 @@ jobs:
                 issue_number: prNumber,
                 body: comment
               });
+              console.log(`✅ Posted analysis to PR #${prNumber}`);
+            } else {
+              console.log('⚠️ No PR number provided in payload');
+              console.log('Comment that would have been posted:');
+              console.log(comment);
             }
+      
+      - name: Set job summary
+        if: always() && steps.diff.outputs.has_changes == 'true'
+        run: |
+          if [ -f analysis_result.json ]; then
+            CHANGE_TYPE=$(jq -r '.changeType' analysis_result.json)
+            CONFIDENCE=$(jq -r '.confidence' analysis_result.json)
+            SUMMARY=$(jq -r '.summary' analysis_result.json)
+            
+            echo "## 📊 Version Change Analysis" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Recommended Version Bump:** \`$CHANGE_TYPE\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Confidence:** $CONFIDENCE" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Summary" >> $GITHUB_STEP_SUMMARY
+            echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+          fi
