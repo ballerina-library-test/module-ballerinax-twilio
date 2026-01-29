@@ -280,7 +280,8 @@ function sendToAnthropic(http:Client httpClient, string apiKey, Message[] messag
             string textResult = check httpResponse.getTextPayload();
             
             if statusCode != 200 {
-                io:println(string `⚠️ Response status ${statusCode}: ${textResult.substring(0, 200)}`);
+                int previewLen = textResult.length() < 200 ? textResult.length() : 200;
+                io:println(string `⚠️ Response status ${statusCode}: ${textResult.substring(0, previewLen)}`);
                 if statusCode == 429 {
                     retryCount = retryCount + 1;
                     if retryCount < MAX_RETRIES {
