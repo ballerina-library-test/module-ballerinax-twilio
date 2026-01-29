@@ -8,8 +8,8 @@ import ballerina/regex;
 const string ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 const int MAX_RETRIES = 2;
 const decimal RETRY_DELAY_SECONDS = 3.0;
-// Conservative chunk size (~100K tokens worth of content)
-const int CHUNK_SIZE_CHARS = 400000;
+// Chunk size to stay well under 200K token limit (~37.5K tokens per chunk)
+const int CHUNK_SIZE_CHARS = 150000;
 
 type AnalysisResult record {
     string changeType;
@@ -156,23 +156,15 @@ function analyzeWithAnthropicMultiTurn(string[] diffChunks) returns AnalysisResu
         timeout: 90
     });
     
-    // Build conversation history
-    Message[] messages = [];
-    
-    // First message: Explain the task
+    // System instructions that will be included with final analysis only
     string systemInstructions = string `You are analyzing git diff output for a Ballerina connector to determine the semantic version change needed.
-
-I will provide you with git diff content in multiple parts. Please:
-1. Read and acknowledge each part I send
-2. Wait for me to say "ALL PARTS SENT - ANALYZE NOW" before providing your analysis
-3. Then analyze ALL the diffs I've sent to determine the version change
 
 RULES FOR VERSION CLASSIFICATION:
 - MAJOR: Breaking changes (removed/renamed methods, removed/renamed types, changed method signatures, changed field types, removed fields)
 - MINOR: Backward-compatible additions (new methods, new types, new optional fields)
 - PATCH: Documentation changes, internal refactoring, bug fixes with no API surface changes
 
-When I ask for analysis, respond with ONLY a JSON object (no markdown, no explanation):
+Respond with ONLY a JSON object (no markdown, no explanation):
 {
   "changeType": "MAJOR|MINOR|PATCH",
   "breakingChanges": ["list specific breaking changes"],
@@ -182,69 +174,93 @@ When I ask for analysis, respond with ONLY a JSON object (no markdown, no explan
   "confidence": 0.95
 }`;
     
-    messages.push({
-        role: "user",
-        content: systemInstructions
-    });
-    
-    // Send each chunk and get acknowledgment
+    // Build complete diff content to send in final request
+    string completeDiff = "";
     foreach int i in 0 ..< diffChunks.length() {
-        int chunkNum = i + 1;
-        io:println(string `📤 Sending chunk ${chunkNum}/${diffChunks.length()}...`);
+        completeDiff += diffChunks[i];
+        if i < diffChunks.length() - 1 {
+            completeDiff += "\n\n";
+        }
+    }
+    
+    io:println(string `📏 Complete diff size: ${completeDiff.length()} chars`);
+    
+    // Check if complete diff fits in one message (with safety margin)
+    // 200K tokens = ~800K chars, leaving room for instructions
+    if completeDiff.length() < 700000 {
+        // Send everything in one request
+        io:println("✅ Diff fits in single request");
+        Message[] messages = [{
+            role: "user",
+            content: string `${systemInstructions}
+
+GIT DIFF:
+${completeDiff}`
+        }];
         
-        // Add chunk to conversation
-        string chunkMessage = string `PART ${chunkNum}/${diffChunks.length()}:
+        json response = check sendToAnthropic(anthropicClient, apiKey, messages, 2048);
+        json contentJson = check response.content;
+        json[] content = check contentJson.ensureType();
+        string text = check content[0].text;
+        
+        text = regex:replaceAll(text.trim(), "```json|```", "");
+        return check value:fromJsonStringWithType(text.trim());
+    } else {
+        // Multi-turn approach for very large diffs
+        io:println("⚠️ Using multi-turn approach for large diff");
+        
+        // Send chunks with minimal conversation history to avoid token overflow
+        string summaries = "";
+        
+        foreach int i in 0 ..< diffChunks.length() {
+            int chunkNum = i + 1;
+            io:println(string `📤 Processing chunk ${chunkNum}/${diffChunks.length()}...`);
+            
+            // Create a fresh message for each chunk to keep conversation short
+            Message[] chunkMessages = [{
+                role: "user",
+                content: string `Analyze this git diff chunk (part ${chunkNum}/${diffChunks.length()}) and provide a brief summary of the changes. Focus on: breaking changes, new features, and bug fixes.
 
 ${diffChunks[i]}
 
----
-This was part ${chunkNum} of ${diffChunks.length()}. ${chunkNum < diffChunks.length() ? "More parts coming." : "This is the final part. Please wait for my analysis request."}`;
-        
-        messages.push({
-            role: "user",
-            content: chunkMessage
-        });
-        
-        // Get acknowledgment from Claude (except for last chunk)
-        if i < diffChunks.length() - 1 {
-            json response = check sendToAnthropic(anthropicClient, apiKey, messages, 100);
+Respond with a concise summary (2-3 sentences).`
+            }];
+            
+            json response = check sendToAnthropic(anthropicClient, apiKey, chunkMessages, 500);
             json contentJson = check response.content;
             json[] content = check contentJson.ensureType();
-            string assistantReply = check content[0].text;
+            string chunkSummary = check content[0].text;
             
-            io:println(string `✅ Chunk ${chunkNum} acknowledged`);
+            summaries += string `CHUNK ${chunkNum}: ${chunkSummary}\n\n`;
+            io:println(string `✅ Chunk ${chunkNum} summarized`);
             
-            // Add assistant's acknowledgment to conversation
-            messages.push({
-                role: "assistant",
-                content: assistantReply
-            });
-            
-            // Small delay to avoid rate limits
+            // Delay between requests
             if i < diffChunks.length() - 1 {
                 runtime:sleep(1.0);
             }
         }
+        
+        // Final analysis based on all summaries
+        io:println("\n🤖 Generating final analysis from summaries...");
+        Message[] finalMessages = [{
+            role: "user",
+            content: string `${systemInstructions}
+
+I've analyzed ${diffChunks.length()} chunks of a git diff for a Ballerina connector. Here are the summaries:
+
+${summaries}
+
+Based on these summaries, provide the final version change analysis.`
+        }];
+        
+        json response = check sendToAnthropic(anthropicClient, apiKey, finalMessages, 2048);
+        json contentJson = check response.content;
+        json[] content = check contentJson.ensureType();
+        string text = check content[0].text;
+        
+        text = regex:replaceAll(text.trim(), "```json|```", "");
+        return check value:fromJsonStringWithType(text.trim());
     }
-    
-    // Final request: Ask for analysis
-    io:println("\n🤖 Requesting final analysis...");
-    messages.push({
-        role: "user",
-        content: "ALL PARTS SENT - ANALYZE NOW. Please analyze all the git diff parts I've sent and provide your version change analysis in the JSON format specified earlier."
-    });
-    
-    json response = check sendToAnthropic(anthropicClient, apiKey, messages, 1024);
-    
-    json contentJson = check response.content;
-    json[] content = check contentJson.ensureType();
-    string text = check content[0].text;
-    
-    io:println(string `🔍 Extracted analysis: ${text.substring(0, text.length() < 200 ? text.length() : 200)}...`);
-    
-    // Clean and parse JSON
-    text = regex:replaceAll(text.trim(), "```json|```", "");
-    return check value:fromJsonStringWithType(text.trim());
 }
 
 // Helper function to send request to Anthropic
@@ -256,7 +272,6 @@ function sendToAnthropic(http:Client httpClient, string apiKey, Message[] messag
             "content": msg.content
         });
     }
-    
     json payload = {
         "model": "claude-sonnet-4-20250514",
         "max_tokens": maxTokens,
@@ -280,8 +295,7 @@ function sendToAnthropic(http:Client httpClient, string apiKey, Message[] messag
             string textResult = check httpResponse.getTextPayload();
             
             if statusCode != 200 {
-                int previewLen = textResult.length() < 200 ? textResult.length() : 200;
-                io:println(string `⚠️ Response status ${statusCode}: ${textResult.substring(0, previewLen)}`);
+                io:println(string `⚠️ Response status ${statusCode}: ${textResult.substring(0, 200)}`);
                 if statusCode == 429 {
                     retryCount = retryCount + 1;
                     if retryCount < MAX_RETRIES {
