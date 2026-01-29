@@ -8,8 +8,8 @@ import ballerina/regex;
 const string ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 const int MAX_RETRIES = 2;
 const decimal RETRY_DELAY_SECONDS = 3.0;
-// Max characters to send to API (~4 chars per token, limit to ~150K tokens worth)
-const int MAX_DIFF_CHARS = 600000;
+// Conservative chunk size (~100K tokens worth of content)
+const int CHUNK_SIZE_CHARS = 400000;
 
 type AnalysisResult record {
     string changeType;
@@ -20,32 +20,159 @@ type AnalysisResult record {
     decimal confidence;
 };
 
-type DiffSection record {
-    string fileName;
+type Message record {
+    string role;
     string content;
-    int priority; // Higher = more important
 };
 
-function analyzeWithAnthropic(string gitDiff) returns AnalysisResult|error {
+// Split diff into manageable chunks by file sections
+// NOTE: The diff should only contain client.bal and types.bal as per workflow
+function splitDiffIntoChunks(string diff) returns string[] {
+    io:println("🔍 Parsing diff into file sections...");
+    
+    // Parse into file sections
+    string[] lines = regex:split(diff, "\n");
+    map<string> fileSections = {};
+    
+    string currentFile = "";
+    string currentContent = "";
+    
+    foreach string line in lines {
+        if line.startsWith("diff --git") {
+            // Save previous section
+            if currentFile != "" {
+                fileSections[currentFile] = currentContent;
+            }
+            
+            // Extract new filename
+            string[] parts = regex:split(line, " ");
+            if parts.length() >= 4 {
+                string filePath = parts[3];
+                currentFile = filePath.substring(2); // Remove "b/"
+            }
+            currentContent = line + "\n";
+        } else {
+            currentContent += line + "\n";
+        }
+    }
+    
+    // Add last section
+    if currentFile != "" {
+        fileSections[currentFile] = currentContent;
+    }
+    
+    io:println(string `📁 Files found in diff: ${fileSections.keys().toString()}`);
+    
+    // Build chunks - process files in priority order
+    string[] chunks = [];
+    
+    // Priority 1: client.bal (contains public API methods)
+    string? clientContent = fileSections["ballerina/client.bal"];
+    if clientContent is string {
+        io:println(string `📄 Processing ballerina/client.bal (${clientContent.length()} chars)`);
+        if clientContent.length() > CHUNK_SIZE_CHARS {
+            // Split large file into multiple chunks
+            string[] clientChunks = splitLargeContent("ballerina/client.bal", clientContent);
+            io:println(string `   ↳ Split into ${clientChunks.length()} chunks`);
+            chunks.push(...clientChunks);
+        } else {
+            chunks.push(clientContent);
+            io:println("   ↳ Fits in 1 chunk");
+        }
+    }
+    
+    // Priority 2: types.bal (contains type definitions)
+    string? typesContent = fileSections["ballerina/types.bal"];
+    if typesContent is string {
+        io:println(string `📄 Processing ballerina/types.bal (${typesContent.length()} chars)`);
+        if typesContent.length() > CHUNK_SIZE_CHARS {
+            string[] typesChunks = splitLargeContent("ballerina/types.bal", typesContent);
+            io:println(string `   ↳ Split into ${typesChunks.length()} chunks`);
+            chunks.push(...typesChunks);
+        } else {
+            chunks.push(typesContent);
+            io:println("   ↳ Fits in 1 chunk");
+        }
+    }
+    
+    // If there are any other files (shouldn't happen based on workflow), add them
+    foreach string fileName in fileSections.keys() {
+        if fileName != "ballerina/client.bal" && fileName != "ballerina/types.bal" {
+            io:println(string `⚠️ Unexpected file in diff: ${fileName}`);
+            string content = fileSections.get(fileName);
+            if content.length() > CHUNK_SIZE_CHARS {
+                chunks.push(...splitLargeContent(fileName, content));
+            } else {
+                chunks.push(content);
+            }
+        }
+    }
+    
+    return chunks;
+}
+
+// Split a large file's diff into smaller chunks
+function splitLargeContent(string fileName, string content) returns string[] {
+    string[] chunks = [];
+    string[] lines = regex:split(content, "\n");
+    
+    string currentChunk = string `--- FILE: ${fileName} (Part ${chunks.length() + 1}) ---\n`;
+    int currentSize = currentChunk.length();
+    
+    foreach string line in lines {
+        int lineSize = line.length() + 1; // +1 for newline
+        
+        if currentSize + lineSize > CHUNK_SIZE_CHARS && currentChunk.length() > 0 {
+            // Save current chunk and start new one
+            chunks.push(currentChunk);
+            currentChunk = string `--- FILE: ${fileName} (Part ${chunks.length() + 1}) - CONTINUED ---\n`;
+            currentSize = currentChunk.length();
+        }
+        
+        currentChunk += line + "\n";
+        currentSize += lineSize;
+    }
+    
+    // Add final chunk
+    if currentChunk.length() > 0 {
+        chunks.push(currentChunk);
+    }
+    
+    return chunks;
+}
+
+function analyzeWithAnthropicMultiTurn(string[] diffChunks) returns AnalysisResult|error {
     string apiKey = os:getEnv("ANTHROPIC_API_KEY");
     
     if apiKey == "" {
         return error("ANTHROPIC_API_KEY environment variable is not set");
     }
     
-    io:println(string `🔑 Using Anthropic API (${apiKey.length()} chars)`);
+    io:println(string `🔑 Using Anthropic API for multi-turn analysis`);
+    io:println(string `📦 Total chunks to send: ${diffChunks.length()}`);
     
-    string prompt = string `You are analyzing git diff output for a Ballerina connector to determine the semantic version change needed.
+    http:Client anthropicClient = check new ("https://api.anthropic.com", {
+        httpVersion: http:HTTP_1_1,
+        timeout: 90
+    });
+    
+    // Build conversation history
+    Message[] messages = [];
+    
+    // First message: Explain the task
+    string systemInstructions = string `You are analyzing git diff output for a Ballerina connector to determine the semantic version change needed.
 
-GIT DIFF:
-${gitDiff}
+I will provide you with git diff content in multiple parts. Please:
+1. Read and acknowledge each part I send
+2. Wait for me to say "ALL PARTS SENT - ANALYZE NOW" before providing your analysis
+3. Then analyze ALL the diffs I've sent to determine the version change
 
 RULES FOR VERSION CLASSIFICATION:
 - MAJOR: Breaking changes (removed/renamed methods, removed/renamed types, changed method signatures, changed field types, removed fields)
 - MINOR: Backward-compatible additions (new methods, new types, new optional fields)
 - PATCH: Documentation changes, internal refactoring, bug fixes with no API surface changes
 
-Analyze the diff and respond with ONLY a JSON object (no markdown, no explanation):
+When I ask for analysis, respond with ONLY a JSON object (no markdown, no explanation):
 {
   "changeType": "MAJOR|MINOR|PATCH",
   "breakingChanges": ["list specific breaking changes"],
@@ -54,17 +181,87 @@ Analyze the diff and respond with ONLY a JSON object (no markdown, no explanatio
   "summary": "concise summary of changes",
   "confidence": 0.95
 }`;
-
-    http:Client anthropicClient = check new ("https://api.anthropic.com", {
-        httpVersion: http:HTTP_1_1,
-        timeout: 60
+    
+    messages.push({
+        role: "user",
+        content: systemInstructions
     });
+    
+    // Send each chunk and get acknowledgment
+    foreach int i in 0 ..< diffChunks.length() {
+        int chunkNum = i + 1;
+        io:println(string `📤 Sending chunk ${chunkNum}/${diffChunks.length()}...`);
+        
+        // Add chunk to conversation
+        string chunkMessage = string `PART ${chunkNum}/${diffChunks.length()}:
+
+${diffChunks[i]}
+
+---
+This was part ${chunkNum} of ${diffChunks.length()}. ${chunkNum < diffChunks.length() ? "More parts coming." : "This is the final part. Please wait for my analysis request."}`;
+        
+        messages.push({
+            role: "user",
+            content: chunkMessage
+        });
+        
+        // Get acknowledgment from Claude (except for last chunk)
+        if i < diffChunks.length() - 1 {
+            json response = check sendToAnthropic(anthropicClient, apiKey, messages, 100);
+            json contentJson = check response.content;
+            json[] content = check contentJson.ensureType();
+            string assistantReply = check content[0].text;
+            
+            io:println(string `✅ Chunk ${chunkNum} acknowledged`);
+            
+            // Add assistant's acknowledgment to conversation
+            messages.push({
+                role: "assistant",
+                content: assistantReply
+            });
+            
+            // Small delay to avoid rate limits
+            if i < diffChunks.length() - 1 {
+                runtime:sleep(1.0);
+            }
+        }
+    }
+    
+    // Final request: Ask for analysis
+    io:println("\n🤖 Requesting final analysis...");
+    messages.push({
+        role: "user",
+        content: "ALL PARTS SENT - ANALYZE NOW. Please analyze all the git diff parts I've sent and provide your version change analysis in the JSON format specified earlier."
+    });
+    
+    json response = check sendToAnthropic(anthropicClient, apiKey, messages, 1024);
+    
+    json contentJson = check response.content;
+    json[] content = check contentJson.ensureType();
+    string text = check content[0].text;
+    
+    io:println(string `🔍 Extracted analysis: ${text.substring(0, text.length() < 200 ? text.length() : 200)}...`);
+    
+    // Clean and parse JSON
+    text = regex:replaceAll(text.trim(), "```json|```", "");
+    return check value:fromJsonStringWithType(text.trim());
+}
+
+// Helper function to send request to Anthropic
+function sendToAnthropic(http:Client httpClient, string apiKey, Message[] messages, int maxTokens) returns json|error {
+    json[] messagesJson = [];
+    foreach Message msg in messages {
+        messagesJson.push({
+            "role": msg.role,
+            "content": msg.content
+        });
+    }
     
     json payload = {
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": 1024,
+        "max_tokens": maxTokens,
         "temperature": 0.1,
-        "messages": [{"role": "user", "content": prompt}]
+        "messages": messagesJson
     };
     
     http:Request req = new;
@@ -73,22 +270,17 @@ Analyze the diff and respond with ONLY a JSON object (no markdown, no explanatio
     req.setHeader("x-api-key", apiKey);
     req.setHeader("content-type", "application/json");
     
-    io:println("📤 Sending request to Anthropic API...");
-    
-    json response = {};
     int retryCount = 0;
-    boolean success = false;
     
-    while !success && retryCount < MAX_RETRIES {
+    while retryCount < MAX_RETRIES {
         do {
-            http:Response httpResponse = check anthropicClient->post("/v1/messages", req);
+            http:Response httpResponse = check httpClient->post("/v1/messages", req);
             int statusCode = httpResponse.statusCode;
-            io:println(string `📥 Response status: ${statusCode}`);
             
             string textResult = check httpResponse.getTextPayload();
             
             if statusCode != 200 {
-                io:println(string `⚠️ Response: ${textResult}`);
+                io:println(string `⚠️ Response status ${statusCode}: ${textResult.substring(0, 200)}`);
                 if statusCode == 429 {
                     retryCount = retryCount + 1;
                     if retryCount < MAX_RETRIES {
@@ -100,7 +292,7 @@ Analyze the diff and respond with ONLY a JSON object (no markdown, no explanatio
                 return error(string `Anthropic API returned status ${statusCode}: ${textResult}`);
             }
             
-            response = check value:fromJsonString(textResult);
+            json response = check value:fromJsonString(textResult);
             
             // Check for API errors
             json|error errorCheck = response.'error;
@@ -109,7 +301,7 @@ Analyze the diff and respond with ONLY a JSON object (no markdown, no explanatio
                 return error(string `Anthropic API Error: ${errorMsg}`);
             }
             
-            success = true;
+            return response;
             
         } on fail error e {
             retryCount = retryCount + 1;
@@ -122,49 +314,45 @@ Analyze the diff and respond with ONLY a JSON object (no markdown, no explanatio
         }
     }
     
-    json contentJson = check response.content;
-    json[] content = check contentJson.ensureType();
-    string text = check content[0].text;
-    
-    io:println(string `🔍 Extracted text: ${text}`);
-    
-    text = regex:replaceAll(text.trim(), "```json|```", "");
-    return check value:fromJsonStringWithType(text.trim());
+    return error("Max retries exceeded");
 }
 
 public function main(string diffFilePath) returns error? {
-    
-    io:println("📊 Analyzing git diff...");
+    io:println("📊 Analyzing git diff with multi-turn approach...");
     io:println(string `📂 Reading diff from: ${diffFilePath}`);
     
     string gitDiffContent = check io:fileReadString(diffFilePath);
-    io:println(string `📏 Original diff size: ${gitDiffContent.length()} chars`);
+    io:println(string `📏 Total diff size: ${gitDiffContent.length()} chars`);
     
     if gitDiffContent.length() == 0 {
         return error("Git diff content is empty");
     }
     
-    // Smart filtering of diff content
-    string processedDiff = gitDiffContent;
-    boolean wasTruncated = false;
+    // Validate that we're only processing client.bal and types.bal
+    io:println("\n🔍 Validating diff content...");
+    boolean hasClientBal = gitDiffContent.includes("ballerina/client.bal");
+    boolean hasTypesBal = gitDiffContent.includes("ballerina/types.bal");
     
-    if gitDiffContent.length() > MAX_DIFF_CHARS {
-        io:println(string `⚠️ Diff too large (${gitDiffContent.length()} chars), applying smart filtering...`);
-        processedDiff = smartFilterDiff(gitDiffContent, MAX_DIFF_CHARS);
-        wasTruncated = true;
-        io:println(string `📏 Filtered diff size: ${processedDiff.length()} chars`);
+    if !hasClientBal && !hasTypesBal {
+        return error("Diff does not contain client.bal or types.bal - nothing to analyze");
     }
     
-    io:println("🤖 Analyzing with Claude...");
+    io:println(string `   ✓ client.bal: ${hasClientBal ? "Found" : "Not found"}`);
+    io:println(string `   ✓ types.bal: ${hasTypesBal ? "Found" : "Not found"}`);
+    io:println("   → Will send COMPLETE diff of these files to Claude in chunks");
     
-    AnalysisResult analysis = check analyzeWithAnthropic(processedDiff);
+    // Split into chunks
+    string[] chunks = splitDiffIntoChunks(gitDiffContent);
+    io:println(string `\n📦 Split into ${chunks.length()} chunks for multi-turn analysis`);
     
-    // Adjust confidence if diff was truncated
-    if wasTruncated && analysis.confidence > 0.7d {
-        decimal originalConfidence = analysis.confidence;
-        analysis.confidence = analysis.confidence * 0.85; // Reduce confidence by 15%
-        io:println(string `⚠️ Confidence adjusted from ${originalConfidence} to ${analysis.confidence} due to diff truncation`);
+    foreach int i in 0 ..< chunks.length() {
+        io:println(string `   Chunk ${i + 1}: ${chunks[i].length()} chars`);
     }
+    
+    // Analyze with multi-turn conversation
+    io:println("\n🤖 Starting multi-turn analysis with Claude...");
+    io:println("   → Sending complete diff (no filtering, no truncation)");
+    AnalysisResult analysis = check analyzeWithAnthropicMultiTurn(chunks);
     
     // Output results
     io:println("\n" + repeatString("=", 60));
@@ -209,248 +397,6 @@ function repeatString(string s, int n) returns string {
     string result = "";
     foreach int i in 0 ..< n {
         result = result + s;
-    }
-    return result;
-}
-
-// Smart filtering: prioritizes meaningful changes over noise
-function smartFilterDiff(string diff, int maxChars) returns string {
-    io:println("🔍 Applying smart diff filtering...");
-    
-    // Parse diff into sections by file
-    DiffSection[] sections = parseDiffSections(diff);
-    
-    io:println(string `📑 Found ${sections.length()} diff sections`);
-    
-    // Sort by priority (higher priority first)
-    sections = sortByPriority(sections);
-    
-    // Build optimized diff within size limit
-    string result = "";
-    int totalSize = 0;
-    int includedSections = 0;
-    
-    foreach DiffSection section in sections {
-        // Add header for this file
-        string sectionHeader = string `\n--- ${section.fileName} ---\n`;
-        string sectionContent = filterNoiseFromSection(section.content);
-        
-        int sectionSize = sectionHeader.length() + sectionContent.length();
-        
-        // Reserve space for summary footer
-        int reservedSpace = 500;
-        
-        if totalSize + sectionSize + reservedSpace <= maxChars {
-            result += sectionHeader + sectionContent;
-            totalSize += sectionSize;
-            includedSections += 1;
-        } else {
-            // Try to include partial content from high-priority sections
-            int remainingSpace = maxChars - totalSize - reservedSpace - sectionHeader.length();
-            if remainingSpace > 500 && section.priority >= 3 {
-                string partialContent = extractMostImportantChanges(sectionContent, remainingSpace);
-                result += sectionHeader + partialContent;
-                totalSize += sectionHeader.length() + partialContent.length();
-                includedSections += 1;
-            }
-            break;
-        }
-    }
-    
-    // Add summary footer
-    string footer = string `
-
-[FILTERING SUMMARY]
-- Included ${includedSections}/${sections.length()} diff sections
-- Prioritized: public APIs, type definitions, function signatures
-- Filtered out: whitespace changes, comments, import reordering
-- Total size: ${totalSize} chars (from original ${diff.length()} chars)
-`;
-    
-    result += footer;
-    io:println(string `✅ Included ${includedSections}/${sections.length()} sections`);
-    
-    return result;
-}
-
-// Parse diff into sections by file
-function parseDiffSections(string diff) returns DiffSection[] {
-    DiffSection[] sections = [];
-    string[] lines = regex:split(diff, "\n");
-    
-    string currentFile = "";
-    string currentContent = "";
-    int currentPriority = 1;
-    
-    foreach string line in lines {
-        // Check for file header: diff --git a/... b/...
-        if line.startsWith("diff --git") {
-            // Save previous section if exists
-            if currentFile != "" {
-                sections.push({
-                    fileName: currentFile,
-                    content: currentContent,
-                    priority: currentPriority
-                });
-            }
-            
-            // Extract filename from: diff --git a/ballerina/client.bal b/ballerina/client.bal
-            string[] parts = regex:split(line, " ");
-            if parts.length() >= 4 {
-                string filePath = parts[3]; // b/ballerina/client.bal
-                currentFile = filePath.substring(2); // Remove "b/"
-                currentPriority = calculatePriority(currentFile);
-            }
-            currentContent = line + "\n";
-        } else {
-            currentContent += line + "\n";
-        }
-    }
-    
-    // Add last section
-    if currentFile != "" {
-        sections.push({
-            fileName: currentFile,
-            content: currentContent,
-            priority: currentPriority
-        });
-    }
-    
-    return sections;
-}
-
-// Calculate priority for a file (higher = more important)
-function calculatePriority(string fileName) returns int {
-    // client.bal contains public API methods - highest priority
-    if fileName.includes("client.bal") {
-        return 5;
-    }
-    // types.bal contains type definitions - high priority
-    if fileName.includes("types.bal") {
-        return 4;
-    }
-    // Other .bal files
-    if fileName.endsWith(".bal") {
-        return 2;
-    }
-    // Config files, docs, etc.
-    return 1;
-}
-
-// Sort sections by priority (descending)
-function sortByPriority(DiffSection[] sections) returns DiffSection[] {
-    // Simple bubble sort (sufficient for small arrays)
-    DiffSection[] sorted = sections.clone();
-    int n = sorted.length();
-    
-    foreach int i in 0 ..< n {
-        foreach int j in 0 ..< (n - i - 1) {
-            if sorted[j].priority < sorted[j + 1].priority {
-                // Swap
-                DiffSection temp = sorted[j];
-                sorted[j] = sorted[j + 1];
-                sorted[j + 1] = temp;
-            }
-        }
-    }
-    
-    return sorted;
-}
-
-// Filter out noise from a diff section
-function filterNoiseFromSection(string content) returns string {
-    string[] lines = regex:split(content, "\n");
-    string[] filtered = [];
-    
-    foreach string line in lines {
-        string trimmed = line.trim();
-        
-        // Keep structural lines (file headers, hunk markers)
-        if line.startsWith("diff --git") || 
-           line.startsWith("+++") || 
-           line.startsWith("---") ||
-           line.startsWith("@@") {
-            filtered.push(line);
-            continue;
-        }
-        
-        // Skip pure whitespace changes
-        if trimmed == "+" || trimmed == "-" {
-            continue;
-        }
-        
-        // Skip comment-only changes (basic detection)
-        if (trimmed.startsWith("+#") || trimmed.startsWith("-#") ||
-            trimmed.startsWith("+//") || trimmed.startsWith("-//")) {
-            continue;
-        }
-        
-        // Keep everything else (actual code changes)
-        filtered.push(line);
-    }
-    
-    return joinStrings(filtered, "\n");
-}
-
-// Extract most important changes from a section
-function extractMostImportantChanges(string content, int maxChars) returns string {
-    string[] lines = regex:split(content, "\n");
-    string[] important = [];
-    int totalChars = 0;
-    
-    // Priority keywords that indicate important changes
-    string[] highPriorityKeywords = [
-        "public function", "resource function", "remote function",
-        "public type", "public record", "public enum",
-        "returns", "isolated", "transactional"
-    ];
-    
-    // First pass: collect lines with high-priority keywords
-    foreach string line in lines {
-        if totalChars >= maxChars {
-            break;
-        }
-        
-        string lower = line.toLowerAscii();
-        boolean isImportant = false;
-        
-        // Check for structural markers
-        if line.startsWith("@@") || line.startsWith("+++") || line.startsWith("---") {
-            isImportant = true;
-        } else {
-            // Check for high-priority keywords
-            foreach string keyword in highPriorityKeywords {
-                if lower.includes(keyword.toLowerAscii()) {
-                    isImportant = true;
-                    break;
-                }
-            }
-        }
-        
-        if isImportant {
-            important.push(line);
-            totalChars += line.length() + 1; // +1 for newline
-        }
-    }
-    
-    string result = joinStrings(important, "\n");
-    
-    // Add truncation notice if we didn't include everything
-    if totalChars >= maxChars {
-        result += "\n... [Additional changes truncated] ...\n";
-    }
-    
-    return result;
-}
-
-// Helper function to join strings
-function joinStrings(string[] arr, string separator) returns string {
-    string result = "";
-    foreach int i in 0 ..< arr.length() {
-        if i > 0 {
-            result += separator;
-        }
-        result += arr[i];
     }
     return result;
 }

@@ -16,16 +16,20 @@ jobs:
         with:
           fetch-depth: 0
       
-      - name: Generate focused git diff
+      - name: Generate complete git diff
         id: diff
         run: |
-          echo "Generating diff between master and auto-generate-connector branches..."
+          echo "Generating complete diff between master and auto-generate-connector branches..."
+          echo "📁 Files to analyze: ballerina/client.bal and ballerina/types.bal ONLY"
+          echo ""
           
-          # Generate diff focusing on client.bal and types.bal
-          # --unified=3 gives 3 lines of context (default, but explicit)
-          # --ignore-all-space to reduce noise from formatting
+          # Generate COMPLETE diff for ONLY client.bal and types.bal
+          # These are the two files that contain:
+          #   - client.bal: Public API methods and remote functions
+          #   - types.bal: Type definitions, records, and enums
+          # No truncation - we'll send the FULL content to Claude in chunks
           git diff origin/master...origin/auto-generate-connector \
-            --unified=3 \
+            --unified=5 \
             -- ballerina/client.bal ballerina/types.bal > git_diff.txt
           
           # Check if diff is not empty
@@ -39,18 +43,19 @@ jobs:
           DIFF_SIZE=$(wc -c < git_diff.txt)
           DIFF_LINES=$(wc -l < git_diff.txt)
           
-          echo "✅ Diff generated successfully"
+          echo "✅ Complete diff generated successfully"
           echo "📏 Size: $DIFF_SIZE bytes ($DIFF_LINES lines)"
           echo "has_changes=true" >> $GITHUB_OUTPUT
           echo "diff_size=$DIFF_SIZE" >> $GITHUB_OUTPUT
           echo "diff_lines=$DIFF_LINES" >> $GITHUB_OUTPUT
           
-          # Show first 50 lines as preview
+          # Show first 100 lines as preview
           echo ""
-          echo "📋 Diff Preview (first 50 lines):"
+          echo "📋 Diff Preview (first 100 lines):"
           echo "================================"
-          head -n 50 git_diff.txt
+          head -n 100 git_diff.txt
           echo "================================"
+          echo "... (${DIFF_LINES} total lines)"
       
       - name: Set up Ballerina
         if: steps.diff.outputs.has_changes == 'true'
@@ -58,20 +63,24 @@ jobs:
         with:
           version: latest
       
-      - name: Run analysis
+      - name: Run multi-turn analysis
         if: steps.diff.outputs.has_changes == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           cd scripts
           
-          echo "🤖 Starting version change analysis..."
+          echo "🤖 Starting multi-turn version change analysis..."
           echo "📊 Diff statistics:"
           echo "   - Size: ${{ steps.diff.outputs.diff_size }} bytes"
           echo "   - Lines: ${{ steps.diff.outputs.diff_lines }}"
+          echo ""
+          echo "📦 The diff will be split into chunks and sent to Claude"
+          echo "   in a conversational manner to ensure complete analysis."
+          echo ""
           
-          # Run the Ballerina script with the diff file path
-          bal run analyze_version_change.bal -- "../git_diff.txt"
+          # Run the enhanced Ballerina script with multi-turn support
+          bal run analyze_version_change_chunked.bal -- "../git_diff.txt"
           
           # Move result to root for easier access
           mv analysis_result.json ../
@@ -131,12 +140,13 @@ jobs:
             const emoji = changeTypeEmoji[analysis.changeType] || '⚪';
             
             // Build comment
-            let comment = `## ${emoji} Version Change Analysis\n\n`;
+            let comment = `## ${emoji} Version Change Analysis (Multi-Turn Analysis)\n\n`;
             comment += `| Metric | Value |\n`;
             comment += `|--------|-------|\n`;
             comment += `| **Recommended Version Bump** | \`${analysis.changeType}\` |\n`;
             comment += `| **Confidence Score** | ${(analysis.confidence * 100).toFixed(1)}% |\n`;
             comment += `| **Diff Size** | ${diffSize} bytes (${diffLines} lines) |\n`;
+            comment += `| **Analysis Method** | Multi-turn (Complete diff analyzed) |\n`;
             comment += `\n`;
             
             comment += `### 📝 Summary\n${analysis.summary}\n\n`;
@@ -173,7 +183,7 @@ jobs:
             comment += `- **MINOR (🟡)**: New features added in a backward-compatible manner\n`;
             comment += `- **PATCH (🟢)**: Bug fixes and improvements with no API changes\n`;
             comment += `\n`;
-            comment += `*This analysis was performed using AI-powered diff analysis. Please review the changes manually before merging.*\n`;
+            comment += `*This analysis was performed using multi-turn AI analysis with the complete diff content sent in chunks.*\n`;
             comment += `</details>\n`;
             
             // Post comment to PR
@@ -201,10 +211,11 @@ jobs:
             CONFIDENCE=$(jq -r '.confidence' analysis_result.json)
             SUMMARY=$(jq -r '.summary' analysis_result.json)
             
-            echo "## 📊 Version Change Analysis" >> $GITHUB_STEP_SUMMARY
+            echo "## 📊 Version Change Analysis (Multi-Turn)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Recommended Version Bump:** \`$CHANGE_TYPE\`" >> $GITHUB_STEP_SUMMARY
             echo "**Confidence:** $CONFIDENCE" >> $GITHUB_STEP_SUMMARY
+            echo "**Analysis Method:** Complete diff analyzed using multi-turn conversation" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### Summary" >> $GITHUB_STEP_SUMMARY
             echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
