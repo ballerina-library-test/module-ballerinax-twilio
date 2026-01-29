@@ -80,7 +80,7 @@ jobs:
           echo ""
           
           # Run the enhanced Ballerina script with multi-turn support
-          bal run analyze_version_change_chunked.bal -- "../git_diff.txt"
+          bal run analyze_version_change.bal -- "../git_diff.txt"
           
           # Move result to root for easier access
           mv analysis_result.json ../
