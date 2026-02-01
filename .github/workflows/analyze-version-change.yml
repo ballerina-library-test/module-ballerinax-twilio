@@ -28,7 +28,7 @@ jobs:
           #   - client.bal: Public API methods and remote functions
           #   - types.bal: Type definitions, records, and enums
           # No truncation - we'll send the FULL content to Claude in chunks
-          git diff origin/master...origin/correctauto-generate-connector \
+          git diff origin/master...origin/correct-auto-generate-connector \
             --unified=5 \
             -- ballerina/client.bal ballerina/types.bal > git_diff.txt
 
