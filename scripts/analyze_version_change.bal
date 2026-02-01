@@ -29,21 +29,21 @@ type Message record {
 // NOTE: The diff should only contain client.bal and types.bal as per workflow
 function splitDiffIntoChunks(string diff) returns string[] {
     io:println("🔍 Parsing diff into file sections...");
-    
+
     // Parse into file sections
     string[] lines = regex:split(diff, "\n");
     map<string> fileSections = {};
-    
+
     string currentFile = "";
     string currentContent = "";
-    
+
     foreach string line in lines {
         if line.startsWith("diff --git") {
             // Save previous section
             if currentFile != "" {
                 fileSections[currentFile] = currentContent;
             }
-            
+
             // Extract new filename
             string[] parts = regex:split(line, " ");
             if parts.length() >= 4 {
@@ -55,17 +55,17 @@ function splitDiffIntoChunks(string diff) returns string[] {
             currentContent += line + "\n";
         }
     }
-    
+
     // Add last section
     if currentFile != "" {
         fileSections[currentFile] = currentContent;
     }
-    
+
     io:println(string `📁 Files found in diff: ${fileSections.keys().toString()}`);
-    
+
     // Build chunks - process files in priority order
     string[] chunks = [];
-    
+
     // Priority 1: client.bal (contains public API methods)
     string? clientContent = fileSections["ballerina/client.bal"];
     if clientContent is string {
@@ -80,7 +80,7 @@ function splitDiffIntoChunks(string diff) returns string[] {
             io:println("   ↳ Fits in 1 chunk");
         }
     }
-    
+
     // Priority 2: types.bal (contains type definitions)
     string? typesContent = fileSections["ballerina/types.bal"];
     if typesContent is string {
@@ -94,7 +94,7 @@ function splitDiffIntoChunks(string diff) returns string[] {
             io:println("   ↳ Fits in 1 chunk");
         }
     }
-    
+
     // If there are any other files (shouldn't happen based on workflow), add them
     foreach string fileName in fileSections.keys() {
         if fileName != "ballerina/client.bal" && fileName != "ballerina/types.bal" {
@@ -107,7 +107,7 @@ function splitDiffIntoChunks(string diff) returns string[] {
             }
         }
     }
-    
+
     return chunks;
 }
 
@@ -115,47 +115,47 @@ function splitDiffIntoChunks(string diff) returns string[] {
 function splitLargeContent(string fileName, string content) returns string[] {
     string[] chunks = [];
     string[] lines = regex:split(content, "\n");
-    
+
     string currentChunk = string `--- FILE: ${fileName} (Part ${chunks.length() + 1}) ---\n`;
     int currentSize = currentChunk.length();
-    
+
     foreach string line in lines {
         int lineSize = line.length() + 1; // +1 for newline
-        
+
         if currentSize + lineSize > CHUNK_SIZE_CHARS && currentChunk.length() > 0 {
             // Save current chunk and start new one
             chunks.push(currentChunk);
             currentChunk = string `--- FILE: ${fileName} (Part ${chunks.length() + 1}) - CONTINUED ---\n`;
             currentSize = currentChunk.length();
         }
-        
+
         currentChunk += line + "\n";
         currentSize += lineSize;
     }
-    
+
     // Add final chunk
     if currentChunk.length() > 0 {
         chunks.push(currentChunk);
     }
-    
+
     return chunks;
 }
 
 function analyzeWithAnthropicMultiTurn(string[] diffChunks) returns AnalysisResult|error {
     string apiKey = os:getEnv("ANTHROPIC_API_KEY");
-    
+
     if apiKey == "" {
         return error("ANTHROPIC_API_KEY environment variable is not set");
     }
-    
+
     io:println(string `🔑 Using Anthropic API for multi-turn analysis`);
     io:println(string `📦 Total chunks to send: ${diffChunks.length()}`);
-    
+
     http:Client anthropicClient = check new ("https://api.anthropic.com", {
         httpVersion: http:HTTP_1_1,
         timeout: 90
     });
-    
+
     // System instructions that will be included with final analysis only
     string systemInstructions = string `You are analyzing git diff output for a Ballerina connector to determine the semantic version change needed.
 
@@ -173,7 +173,7 @@ Respond with ONLY a JSON object (no markdown, no explanation):
   "summary": "concise summary of changes",
   "confidence": 0.95
 }`;
-    
+
     // Build complete diff content to send in final request
     string completeDiff = "";
     foreach int i in 0 ..< diffChunks.length() {
@@ -182,9 +182,9 @@ Respond with ONLY a JSON object (no markdown, no explanation):
             completeDiff += "\n\n";
         }
     }
-    
+
     io:println(string `📏 Complete diff size: ${completeDiff.length()} chars`);
-    
+
     // Check if complete diff fits in one message (with safety margin)
     // 200K tokens = ~800K chars, leaving room for instructions
     if completeDiff.length() < 700000 {
@@ -197,25 +197,25 @@ Respond with ONLY a JSON object (no markdown, no explanation):
 GIT DIFF:
 ${completeDiff}`
         }];
-        
+
         json response = check sendToAnthropic(anthropicClient, apiKey, messages, 2048);
         json contentJson = check response.content;
         json[] content = check contentJson.ensureType();
         string text = check content[0].text;
-        
+
         text = regex:replaceAll(text.trim(), "```json|```", "");
         return check value:fromJsonStringWithType(text.trim());
     } else {
         // Multi-turn approach for very large diffs
         io:println("⚠️ Using multi-turn approach for large diff");
-        
+
         // Send chunks with minimal conversation history to avoid token overflow
         string summaries = "";
-        
+
         foreach int i in 0 ..< diffChunks.length() {
             int chunkNum = i + 1;
             io:println(string `📤 Processing chunk ${chunkNum}/${diffChunks.length()}...`);
-            
+
             // Create a fresh message for each chunk to keep conversation short
             Message[] chunkMessages = [{
                 role: "user",
@@ -225,21 +225,21 @@ ${diffChunks[i]}
 
 Respond with a concise summary (2-3 sentences).`
             }];
-            
+
             json response = check sendToAnthropic(anthropicClient, apiKey, chunkMessages, 500);
             json contentJson = check response.content;
             json[] content = check contentJson.ensureType();
             string chunkSummary = check content[0].text;
-            
+
             summaries += string `CHUNK ${chunkNum}: ${chunkSummary}\n\n`;
             io:println(string `✅ Chunk ${chunkNum} summarized`);
-            
+
             // Delay between requests
             if i < diffChunks.length() - 1 {
                 runtime:sleep(1.0);
             }
         }
-        
+
         // Final analysis based on all summaries
         io:println("\n🤖 Generating final analysis from summaries...");
         Message[] finalMessages = [{
@@ -252,12 +252,12 @@ ${summaries}
 
 Based on these summaries, provide the final version change analysis.`
         }];
-        
+
         json response = check sendToAnthropic(anthropicClient, apiKey, finalMessages, 2048);
         json contentJson = check response.content;
         json[] content = check contentJson.ensureType();
         string text = check content[0].text;
-        
+
         text = regex:replaceAll(text.trim(), "```json|```", "");
         return check value:fromJsonStringWithType(text.trim());
     }
@@ -278,22 +278,22 @@ function sendToAnthropic(http:Client httpClient, string apiKey, Message[] messag
         "temperature": 0.1,
         "messages": messagesJson
     };
-    
+
     http:Request req = new;
     req.setJsonPayload(payload);
     req.setHeader("anthropic-version", "2023-06-01");
     req.setHeader("x-api-key", apiKey);
     req.setHeader("content-type", "application/json");
-    
+
     int retryCount = 0;
-    
+
     while retryCount < MAX_RETRIES {
         do {
             http:Response httpResponse = check httpClient->post("/v1/messages", req);
             int statusCode = httpResponse.statusCode;
-            
+
             string textResult = check httpResponse.getTextPayload();
-            
+
             if statusCode != 200 {
                 io:println(string `⚠️ Response status ${statusCode}: ${textResult.substring(0, 200)}`);
                 if statusCode == 429 {
@@ -306,18 +306,18 @@ function sendToAnthropic(http:Client httpClient, string apiKey, Message[] messag
                 }
                 return error(string `Anthropic API returned status ${statusCode}: ${textResult}`);
             }
-            
+
             json response = check value:fromJsonString(textResult);
-            
+
             // Check for API errors
             json|error errorCheck = response.'error;
             if errorCheck is json {
                 string errorMsg = check errorCheck.message;
                 return error(string `Anthropic API Error: ${errorMsg}`);
             }
-            
+
             return response;
-            
+
         } on fail error e {
             retryCount = retryCount + 1;
             if retryCount < MAX_RETRIES {
@@ -328,47 +328,47 @@ function sendToAnthropic(http:Client httpClient, string apiKey, Message[] messag
             }
         }
     }
-    
+
     return error("Max retries exceeded");
 }
 
 public function main(string diffFilePath) returns error? {
     io:println("📊 Analyzing git diff with multi-turn approach...");
     io:println(string `📂 Reading diff from: ${diffFilePath}`);
-    
+
     string gitDiffContent = check io:fileReadString(diffFilePath);
     io:println(string `📏 Total diff size: ${gitDiffContent.length()} chars`);
-    
+
     if gitDiffContent.length() == 0 {
         return error("Git diff content is empty");
     }
-    
+
     // Validate that we're only processing client.bal and types.bal
     io:println("\n🔍 Validating diff content...");
     boolean hasClientBal = gitDiffContent.includes("ballerina/client.bal");
     boolean hasTypesBal = gitDiffContent.includes("ballerina/types.bal");
-    
+
     if !hasClientBal && !hasTypesBal {
         return error("Diff does not contain client.bal or types.bal - nothing to analyze");
     }
-    
+
     io:println(string `   ✓ client.bal: ${hasClientBal ? "Found" : "Not found"}`);
     io:println(string `   ✓ types.bal: ${hasTypesBal ? "Found" : "Not found"}`);
     io:println("   → Will send COMPLETE diff of these files to Claude in chunks");
-    
+
     // Split into chunks
     string[] chunks = splitDiffIntoChunks(gitDiffContent);
     io:println(string `\n📦 Split into ${chunks.length()} chunks for multi-turn analysis`);
-    
+
     foreach int i in 0 ..< chunks.length() {
         io:println(string `   Chunk ${i + 1}: ${chunks[i].length()} chars`);
     }
-    
+
     // Analyze with multi-turn conversation
     io:println("\n🤖 Starting multi-turn analysis with Claude...");
     io:println("   → Sending complete diff (no filtering, no truncation)");
     AnalysisResult analysis = check analyzeWithAnthropicMultiTurn(chunks);
-    
+
     // Output results
     io:println("\n" + repeatString("=", 60));
     io:println("📋 VERSION CHANGE ANALYSIS");
@@ -379,30 +379,30 @@ public function main(string diffFilePath) returns error? {
 
 📝 Summary:
 ${analysis.summary}`);
-    
+
     if analysis.breakingChanges.length() > 0 {
         io:println("\n⚠️  BREAKING CHANGES:");
         foreach string change in analysis.breakingChanges {
             io:println(string `  - ${change}`);
         }
     }
-    
+
     if analysis.newFeatures.length() > 0 {
         io:println("\n✨ NEW FEATURES:");
         foreach string feature in analysis.newFeatures {
             io:println(string `  - ${feature}`);
         }
     }
-    
+
     if analysis.bugFixes.length() > 0 {
         io:println("\n🐛 IMPROVEMENTS:");
         foreach string fix in analysis.bugFixes {
             io:println(string `  - ${fix}`);
         }
     }
-    
+
     io:println("\n" + repeatString("=", 60));
-    
+
     json resultJson = check analysis.cloneWithType(json);
     check io:fileWriteJson("analysis_result.json", resultJson);
     io:println("\n💾 Saved to: analysis_result.json");
