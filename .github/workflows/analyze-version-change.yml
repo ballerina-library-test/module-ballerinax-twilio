@@ -220,3 +220,114 @@ jobs:
             echo "### Summary" >> $GITHUB_STEP_SUMMARY
             echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
           fi
+
+      - name: Update version in gradle.properties
+        if: steps.diff.outputs.has_changes == 'true'
+        id: version_update
+        run: |
+          if [ ! -f analysis_result.json ]; then
+            echo "❌ No analysis result found, skipping version update"
+            exit 1
+          fi
+
+          CHANGE_TYPE=$(jq -r '.changeType' analysis_result.json)
+          echo "📦 Recommended change type: $CHANGE_TYPE"
+
+          # Checkout the correct-auto-generate-connector branch
+          git fetch origin correct-auto-generate-connector
+          git checkout correct-auto-generate-connector
+
+          # Read current version from gradle.properties
+          CURRENT_VERSION=$(grep '^version=' gradle.properties | cut -d'=' -f2)
+          echo "📌 Current version: $CURRENT_VERSION"
+
+          # Remove -SNAPSHOT suffix if present for parsing
+          BASE_VERSION=$(echo "$CURRENT_VERSION" | sed 's/-SNAPSHOT//')
+
+          # Parse version components
+          MAJOR=$(echo "$BASE_VERSION" | cut -d'.' -f1)
+          MINOR=$(echo "$BASE_VERSION" | cut -d'.' -f2)
+          PATCH=$(echo "$BASE_VERSION" | cut -d'.' -f3)
+
+          echo "   Major: $MAJOR, Minor: $MINOR, Patch: $PATCH"
+
+          # Calculate new version based on change type
+          case "$CHANGE_TYPE" in
+            "MAJOR")
+              NEW_MAJOR=$((MAJOR + 1))
+              NEW_VERSION="${NEW_MAJOR}.0.0"
+              ;;
+            "MINOR")
+              NEW_MINOR=$((MINOR + 1))
+              NEW_VERSION="${MAJOR}.${NEW_MINOR}.0"
+              ;;
+            "PATCH")
+              NEW_PATCH=$((PATCH + 1))
+              NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+              ;;
+            *)
+              echo "❌ Unknown change type: $CHANGE_TYPE"
+              exit 1
+              ;;
+          esac
+
+          echo "🔖 New version: $NEW_VERSION"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "change_type=$CHANGE_TYPE" >> $GITHUB_OUTPUT
+
+          # Update gradle.properties
+          sed -i "s/^version=.*/version=${NEW_VERSION}-SNAPSHOT/" gradle.properties
+
+          echo "✅ Updated gradle.properties:"
+          grep '^version=' gradle.properties
+
+      - name: Run Gradle build to update Ballerina files
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          echo "🔨 Running Gradle build to update Ballerina.toml and Dependencies.toml..."
+
+          # Run the Gradle build task that updates the Ballerina files
+          ./gradlew :twilio-ballerina:updateTomlFile
+
+          echo ""
+          echo "📄 Updated Ballerina.toml:"
+          cat ballerina/Ballerina.toml
+
+          echo ""
+          echo "📄 Updated Dependencies.toml:"
+          cat ballerina/Dependencies.toml || echo "Dependencies.toml not found or unchanged"
+
+      - name: Run bal build
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          echo "🔨 Running bal build to verify and finalize dependencies..."
+          cd ballerina
+          bal build --skip-tests
+
+          echo ""
+          echo "✅ Build completed successfully"
+          echo ""
+          echo "📄 Final Ballerina.toml:"
+          cat Ballerina.toml
+
+          echo ""
+          echo "📄 Final Dependencies.toml:"
+          cat Dependencies.toml
+
+      - name: Commit and push version changes
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          NEW_VERSION="${{ steps.version_update.outputs.new_version }}"
+          CHANGE_TYPE="${{ steps.version_update.outputs.change_type }}"
+
+          git add gradle.properties ballerina/Ballerina.toml ballerina/Dependencies.toml
+          git commit -m "Bump version to ${NEW_VERSION}-SNAPSHOT (${CHANGE_TYPE} change)"
+          git push origin correct-auto-generate-connector
+
+          echo "✅ Version changes committed and pushed"
+          echo ""
+          echo "🔖 New version: ${NEW_VERSION}-SNAPSHOT"
+          echo "📝 Change type: ${CHANGE_TYPE}"
