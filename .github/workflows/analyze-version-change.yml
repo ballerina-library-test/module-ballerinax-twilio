@@ -56,37 +56,27 @@ jobs:
         with:
           version: latest
 
-      - name: Verify files
-        if: steps.diff.outputs.has_changes == 'true'
-        run: |
-          echo "📁 Checking required files..."
-          ls -lh analyze_version_change.bal git_diff.txt
-          echo ""
-          echo "🔍 Testing Ballerina compilation..."
-          bal build analyze_version_change.bal || echo "⚠️ Build failed but will try to run"
-
       - name: Run multi-turn analysis
         if: steps.diff.outputs.has_changes == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          cd scripts
+
           echo "🤖 Starting multi-turn version change analysis..."
           echo "📊 Diff statistics:"
           echo "   - Size: ${{ steps.diff.outputs.diff_size }} bytes"
           echo "   - Lines: ${{ steps.diff.outputs.diff_lines }}"
           echo ""
+          echo "📦 The diff will be split into chunks and sent to Claude"
+          echo "   in a conversational manner to ensure complete analysis."
+          echo ""
 
-          # Run analysis
-          bal run analyze_version_change.bal -- "git_diff.txt"
+          bal run analyze_version_change.bal -- "../git_diff.txt"
 
-          # Check if analysis result was created
-          if [ ! -f analysis_result.json ]; then
-            echo "❌ Analysis failed - analysis_result.json not found"
-            exit 1
-          fi
+          mv analysis_result.json ../
 
-          echo "✅ Analysis completed successfully"
-          cat analysis_result.json
+          echo "✅ Analysis complete"
 
       - name: Update version files
         if: steps.diff.outputs.has_changes == 'true'
@@ -136,7 +126,7 @@ jobs:
           echo "🔨 Building Ballerina project to regenerate Dependencies.toml..."
           cd ballerina
           bal build
-          echo "✅ Build complete"
+          echo "✅ Build complete - Dependencies.toml updated"
 
       - name: Commit version changes
         if: steps.diff.outputs.has_changes == 'true'
@@ -211,7 +201,6 @@ jobs:
             comment += `| **New Version** | \`${newVersion}\` |\n`;
             comment += `| **Confidence Score** | ${(analysis.confidence * 100).toFixed(1)}% |\n`;
             comment += `| **Diff Size** | ${diffSize} bytes (${diffLines} lines) |\n`;
-            comment += `| **Analysis Method** | Multi-turn AI analysis |\n`;
             comment += `\n`;
 
             comment += `### 📝 Summary\n${analysis.summary}\n\n`;
@@ -241,18 +230,16 @@ jobs:
             }
 
             comment += `### 📦 Updated Files\n`;
-            comment += `- \`gradle.properties\`: version bumped to \`${newVersion}-SNAPSHOT\`\n`;
-            comment += `- \`ballerina/Ballerina.toml\`: version bumped to \`${newVersion}\`\n`;
-            comment += `- \`ballerina/Dependencies.toml\`: regenerated via \`bal build\`\n\n`;
+            comment += `- \`gradle.properties\`: \`${newVersion}-SNAPSHOT\`\n`;
+            comment += `- \`ballerina/Ballerina.toml\`: \`${newVersion}\`\n`;
+            comment += `- \`ballerina/Dependencies.toml\`: regenerated\n\n`;
 
             comment += `---\n`;
             comment += `<details>\n`;
             comment += `<summary>📚 Version Bump Guidelines</summary>\n\n`;
-            comment += `- **MAJOR (🔴)**: Breaking changes that require users to update their code\n`;
-            comment += `- **MINOR (🟡)**: New features added in a backward-compatible manner\n`;
-            comment += `- **PATCH (🟢)**: Bug fixes and improvements with no API changes\n`;
-            comment += `\n`;
-            comment += `*Version files have been automatically updated and committed.*\n`;
+            comment += `- **MAJOR (🔴)**: Breaking changes\n`;
+            comment += `- **MINOR (🟡)**: New features (backward-compatible)\n`;
+            comment += `- **PATCH (🟢)**: Bug fixes only\n`;
             comment += `</details>\n`;
 
             const prNumber = context.payload.client_payload?.pr_number;
@@ -266,8 +253,7 @@ jobs:
               });
               console.log(`✅ Posted analysis to PR #${prNumber}`);
             } else {
-              console.log('⚠️ No PR number provided in payload');
-              console.log('Comment that would have been posted:');
+              console.log('⚠️ No PR number provided');
               console.log(comment);
             }
 
@@ -282,15 +268,14 @@ jobs:
 
             echo "## 📊 Version Change Analysis" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Recommended Version Bump:** \`$CHANGE_TYPE\`" >> $GITHUB_STEP_SUMMARY
-            echo "**New Version:** \`$NEW_VERSION\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Version Bump:** \`$CHANGE_TYPE\` → \`$NEW_VERSION\`" >> $GITHUB_STEP_SUMMARY
             echo "**Confidence:** $CONFIDENCE" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### Summary" >> $GITHUB_STEP_SUMMARY
             echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Updated Files" >> $GITHUB_STEP_SUMMARY
-            echo "- \`gradle.properties\`" >> $GITHUB_STEP_SUMMARY
-            echo "- \`ballerina/Ballerina.toml\`" >> $GITHUB_STEP_SUMMARY
-            echo "- \`ballerina/Dependencies.toml\`" >> $GITHUB_STEP_SUMMARY
+            echo "### Files Updated" >> $GITHUB_STEP_SUMMARY
+            echo "- gradle.properties" >> $GITHUB_STEP_SUMMARY
+            echo "- ballerina/Ballerina.toml" >> $GITHUB_STEP_SUMMARY
+            echo "- ballerina/Dependencies.toml" >> $GITHUB_STEP_SUMMARY
           fi
