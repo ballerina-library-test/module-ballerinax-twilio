@@ -281,26 +281,18 @@ jobs:
           echo "✅ Updated gradle.properties:"
           grep '^version=' gradle.properties
 
-      - name: Run Gradle build to update Ballerina files
-        if: steps.diff.outputs.has_changes == 'true'
-        run: |
-          echo "🔨 Running Gradle build to update Ballerina.toml and Dependencies.toml..."
-
-          # Run the Gradle build task that updates the Ballerina files
-          ./gradlew :twilio-ballerina:updateTomlFile
-
+          # Also update Ballerina.toml directly with the new version
           echo ""
-          echo "📄 Updated Ballerina.toml:"
-          cat ballerina/Ballerina.toml
+          echo "📄 Updating Ballerina.toml with new version..."
+          sed -i "s/^version = .*/version = \"${NEW_VERSION}\"/" ballerina/Ballerina.toml
 
-          echo ""
-          echo "📄 Updated Dependencies.toml:"
-          cat ballerina/Dependencies.toml || echo "Dependencies.toml not found or unchanged"
+          echo "✅ Updated Ballerina.toml:"
+          grep '^version' ballerina/Ballerina.toml
 
       - name: Run bal build
         if: steps.diff.outputs.has_changes == 'true'
         run: |
-          echo "🔨 Running bal build to verify and finalize dependencies..."
+          echo "🔨 Running bal build to verify and update Dependencies.toml..."
           cd ballerina
           bal build --skip-tests
 
