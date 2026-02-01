@@ -24,19 +24,16 @@ jobs:
           echo "📁 Files to analyze: ballerina/client.bal and ballerina/types.bal ONLY"
           echo ""
 
-          # Generate COMPLETE diff for ONLY client.bal and types.bal
           git diff origin/master...origin/correct-auto-generate-connector \
             --unified=5 \
             -- ballerina/client.bal ballerina/types.bal > git_diff.txt
 
-          # Check if diff is not empty
           if [ ! -s git_diff.txt ]; then
             echo "❌ No changes detected in client.bal or types.bal"
             echo "has_changes=false" >> $GITHUB_OUTPUT
             exit 1
           fi
 
-          # Get diff statistics
           DIFF_SIZE=$(wc -c < git_diff.txt)
           DIFF_LINES=$(wc -l < git_diff.txt)
 
@@ -46,7 +43,6 @@ jobs:
           echo "diff_size=$DIFF_SIZE" >> $GITHUB_OUTPUT
           echo "diff_lines=$DIFF_LINES" >> $GITHUB_OUTPUT
 
-          # Show first 100 lines as preview
           echo ""
           echo "📋 Diff Preview (first 100 lines):"
           echo "================================"
@@ -65,42 +61,29 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          cd scripts
-
           echo "🤖 Starting multi-turn version change analysis..."
           echo "📊 Diff statistics:"
           echo "   - Size: ${{ steps.diff.outputs.diff_size }} bytes"
           echo "   - Lines: ${{ steps.diff.outputs.diff_lines }}"
           echo ""
-          echo "📦 The diff will be split into chunks and sent to Claude"
-          echo "   in a conversational manner to ensure complete analysis."
-          echo ""
 
-          # Run the enhanced Ballerina script with multi-turn support
-          bal run analyze_version_change.bal -- "../git_diff.txt"
-
-          # Move result to root for easier access
-          mv analysis_result.json ../
+          bal run analyze_version_change.bal -- "git_diff.txt"
 
       - name: Update version files
         if: steps.diff.outputs.has_changes == 'true'
         run: |
           echo "📝 Updating version based on AI analysis..."
 
-          # Read AI analysis result
           CHANGE_TYPE=$(jq -r '.changeType' analysis_result.json)
           echo "🔖 Change type: $CHANGE_TYPE"
 
-          # Get current version from gradle.properties
           CURRENT_VERSION=$(grep "^version=" gradle.properties | cut -d'=' -f2 | sed 's/-SNAPSHOT//')
           echo "📌 Current version: $CURRENT_VERSION"
 
-          # Parse version components
           MAJOR=$(echo $CURRENT_VERSION | cut -d'.' -f1)
           MINOR=$(echo $CURRENT_VERSION | cut -d'.' -f2)
           PATCH=$(echo $CURRENT_VERSION | cut -d'.' -f3)
 
-          # Bump version based on change type
           if [ "$CHANGE_TYPE" = "MAJOR" ]; then
             MAJOR=$((MAJOR + 1))
             MINOR=0
@@ -118,15 +101,12 @@ jobs:
           NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
           echo "🆕 New version: $NEW_VERSION"
 
-          # Update gradle.properties
           sed -i "s/^version=.*/version=${NEW_VERSION}-SNAPSHOT/" gradle.properties
           echo "✅ Updated gradle.properties"
 
-          # Update ballerina/Ballerina.toml
           sed -i "s/^version = .*/version = \"${NEW_VERSION}\"/" ballerina/Ballerina.toml
           echo "✅ Updated ballerina/Ballerina.toml"
 
-          # Save version info for later steps
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "change_type=$CHANGE_TYPE" >> $GITHUB_OUTPUT
         id: version_bump
@@ -159,7 +139,6 @@ jobs:
             echo "==================="
             cat analysis_result.json | jq '.'
 
-            # Extract key information
             CHANGE_TYPE=$(jq -r '.changeType' analysis_result.json)
             CONFIDENCE=$(jq -r '.confidence' analysis_result.json)
 
@@ -198,7 +177,6 @@ jobs:
             const diffLines = '${{ steps.diff.outputs.diff_lines }}';
             const newVersion = '${{ steps.version_bump.outputs.new_version }}';
 
-            // Determine emoji and color based on change type
             const changeTypeEmoji = {
               'MAJOR': '🔴',
               'MINOR': '🟡',
@@ -207,7 +185,6 @@ jobs:
 
             const emoji = changeTypeEmoji[analysis.changeType] || '⚪';
 
-            // Build comment
             let comment = `## ${emoji} Version Change Analysis\n\n`;
             comment += `| Metric | Value |\n`;
             comment += `|--------|-------|\n`;
@@ -249,7 +226,6 @@ jobs:
             comment += `- \`ballerina/Ballerina.toml\`: version bumped to \`${newVersion}\`\n`;
             comment += `- \`ballerina/Dependencies.toml\`: regenerated via \`bal build\`\n\n`;
 
-            // Add interpretation guide
             comment += `---\n`;
             comment += `<details>\n`;
             comment += `<summary>📚 Version Bump Guidelines</summary>\n\n`;
@@ -260,7 +236,6 @@ jobs:
             comment += `*Version files have been automatically updated and committed.*\n`;
             comment += `</details>\n`;
 
-            // Post comment to PR
             const prNumber = context.payload.client_payload?.pr_number;
 
             if (prNumber) {
