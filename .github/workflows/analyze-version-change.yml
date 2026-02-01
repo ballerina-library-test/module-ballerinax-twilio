@@ -9,46 +9,43 @@ jobs:
   analyze:
     name: Analyze connector version changes
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
+          ref: correct-auto-generate-connector
+
       - name: Generate complete git diff
         id: diff
         run: |
-          echo "Generating complete diff between master and auto-generate-connector branches..."
+          echo "Generating complete diff between master and correct-auto-generate-connector branches..."
           echo "📁 Files to analyze: ballerina/client.bal and ballerina/types.bal ONLY"
           echo ""
-          
+
           # Generate COMPLETE diff for ONLY client.bal and types.bal
-          # These are the two files that contain:
-          #   - client.bal: Public API methods and remote functions
-          #   - types.bal: Type definitions, records, and enums
-          # No truncation - we'll send the FULL content to Claude in chunks
-          git diff origin/master...origin/auto-generate-connector \
+          git diff origin/master...origin/correct-auto-generate-connector \
             --unified=5 \
             -- ballerina/client.bal ballerina/types.bal > git_diff.txt
-          
+
           # Check if diff is not empty
           if [ ! -s git_diff.txt ]; then
             echo "❌ No changes detected in client.bal or types.bal"
             echo "has_changes=false" >> $GITHUB_OUTPUT
             exit 1
           fi
-          
+
           # Get diff statistics
           DIFF_SIZE=$(wc -c < git_diff.txt)
           DIFF_LINES=$(wc -l < git_diff.txt)
-          
+
           echo "✅ Complete diff generated successfully"
           echo "📏 Size: $DIFF_SIZE bytes ($DIFF_LINES lines)"
           echo "has_changes=true" >> $GITHUB_OUTPUT
           echo "diff_size=$DIFF_SIZE" >> $GITHUB_OUTPUT
           echo "diff_lines=$DIFF_LINES" >> $GITHUB_OUTPUT
-          
+
           # Show first 100 lines as preview
           echo ""
           echo "📋 Diff Preview (first 100 lines):"
@@ -56,20 +53,20 @@ jobs:
           head -n 100 git_diff.txt
           echo "================================"
           echo "... (${DIFF_LINES} total lines)"
-      
+
       - name: Set up Ballerina
         if: steps.diff.outputs.has_changes == 'true'
         uses: ballerina-platform/setup-ballerina@v1.1.0
         with:
           version: latest
-      
+
       - name: Run multi-turn analysis
         if: steps.diff.outputs.has_changes == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           cd scripts
-          
+
           echo "🤖 Starting multi-turn version change analysis..."
           echo "📊 Diff statistics:"
           echo "   - Size: ${{ steps.diff.outputs.diff_size }} bytes"
@@ -78,13 +75,82 @@ jobs:
           echo "📦 The diff will be split into chunks and sent to Claude"
           echo "   in a conversational manner to ensure complete analysis."
           echo ""
-          
+
           # Run the enhanced Ballerina script with multi-turn support
           bal run analyze_version_change.bal -- "../git_diff.txt"
-          
+
           # Move result to root for easier access
           mv analysis_result.json ../
-      
+
+      - name: Update version files
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          echo "📝 Updating version based on AI analysis..."
+
+          # Read AI analysis result
+          CHANGE_TYPE=$(jq -r '.changeType' analysis_result.json)
+          echo "🔖 Change type: $CHANGE_TYPE"
+
+          # Get current version from gradle.properties
+          CURRENT_VERSION=$(grep "^version=" gradle.properties | cut -d'=' -f2 | sed 's/-SNAPSHOT//')
+          echo "📌 Current version: $CURRENT_VERSION"
+
+          # Parse version components
+          MAJOR=$(echo $CURRENT_VERSION | cut -d'.' -f1)
+          MINOR=$(echo $CURRENT_VERSION | cut -d'.' -f2)
+          PATCH=$(echo $CURRENT_VERSION | cut -d'.' -f3)
+
+          # Bump version based on change type
+          if [ "$CHANGE_TYPE" = "MAJOR" ]; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif [ "$CHANGE_TYPE" = "MINOR" ]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          elif [ "$CHANGE_TYPE" = "PATCH" ]; then
+            PATCH=$((PATCH + 1))
+          else
+            echo "❌ Invalid change type: $CHANGE_TYPE"
+            exit 1
+          fi
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "🆕 New version: $NEW_VERSION"
+
+          # Update gradle.properties
+          sed -i "s/^version=.*/version=${NEW_VERSION}-SNAPSHOT/" gradle.properties
+          echo "✅ Updated gradle.properties"
+
+          # Update ballerina/Ballerina.toml
+          sed -i "s/^version = .*/version = \"${NEW_VERSION}\"/" ballerina/Ballerina.toml
+          echo "✅ Updated ballerina/Ballerina.toml"
+
+          # Save version info for later steps
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "change_type=$CHANGE_TYPE" >> $GITHUB_OUTPUT
+        id: version_bump
+
+      - name: Build Ballerina project
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          echo "🔨 Building Ballerina project to regenerate Dependencies.toml..."
+          cd ballerina
+          bal build
+          echo "✅ Build complete"
+
+      - name: Commit version changes
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add gradle.properties ballerina/Ballerina.toml ballerina/Dependencies.toml
+          git commit -m "Bump version to ${{ steps.version_bump.outputs.new_version }} (${{ steps.version_bump.outputs.change_type }})"
+          git push origin correct-auto-generate-connector
+
+          echo "✅ Version files committed and pushed"
+
       - name: Display results
         if: always() && steps.diff.outputs.has_changes == 'true'
         run: |
@@ -92,18 +158,19 @@ jobs:
             echo "📊 Analysis Results:"
             echo "==================="
             cat analysis_result.json | jq '.'
-            
+
             # Extract key information
             CHANGE_TYPE=$(jq -r '.changeType' analysis_result.json)
             CONFIDENCE=$(jq -r '.confidence' analysis_result.json)
-            
+
             echo ""
             echo "🔖 Recommended Version Bump: $CHANGE_TYPE"
+            echo "🆕 New Version: ${{ steps.version_bump.outputs.new_version }}"
             echo "✅ Confidence Score: $CONFIDENCE"
           else
             echo "⚠️ No analysis result found"
           fi
-      
+
       - name: Upload analysis results
         if: steps.diff.outputs.has_changes == 'true'
         uses: actions/upload-artifact@v4
@@ -113,44 +180,46 @@ jobs:
             analysis_result.json
             git_diff.txt
           retention-days: 30
-      
+
       - name: Create enhanced PR comment
         if: github.event_name == 'repository_dispatch' && steps.diff.outputs.has_changes == 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            
+
             if (!fs.existsSync('analysis_result.json')) {
               console.log('❌ No analysis result found');
               return;
             }
-            
+
             const analysis = JSON.parse(fs.readFileSync('analysis_result.json', 'utf8'));
             const diffSize = '${{ steps.diff.outputs.diff_size }}';
             const diffLines = '${{ steps.diff.outputs.diff_lines }}';
-            
+            const newVersion = '${{ steps.version_bump.outputs.new_version }}';
+
             // Determine emoji and color based on change type
             const changeTypeEmoji = {
               'MAJOR': '🔴',
-              'MINOR': '🟡', 
+              'MINOR': '🟡',
               'PATCH': '🟢'
             };
-            
+
             const emoji = changeTypeEmoji[analysis.changeType] || '⚪';
-            
+
             // Build comment
-            let comment = `## ${emoji} Version Change Analysis (Multi-Turn Analysis)\n\n`;
+            let comment = `## ${emoji} Version Change Analysis\n\n`;
             comment += `| Metric | Value |\n`;
             comment += `|--------|-------|\n`;
             comment += `| **Recommended Version Bump** | \`${analysis.changeType}\` |\n`;
+            comment += `| **New Version** | \`${newVersion}\` |\n`;
             comment += `| **Confidence Score** | ${(analysis.confidence * 100).toFixed(1)}% |\n`;
             comment += `| **Diff Size** | ${diffSize} bytes (${diffLines} lines) |\n`;
-            comment += `| **Analysis Method** | Multi-turn (Complete diff analyzed) |\n`;
+            comment += `| **Analysis Method** | Multi-turn AI analysis |\n`;
             comment += `\n`;
-            
+
             comment += `### 📝 Summary\n${analysis.summary}\n\n`;
-            
+
             if (analysis.breakingChanges && analysis.breakingChanges.length > 0) {
               comment += `### ⚠️ Breaking Changes\n`;
               analysis.breakingChanges.forEach(change => {
@@ -158,7 +227,7 @@ jobs:
               });
               comment += '\n';
             }
-            
+
             if (analysis.newFeatures && analysis.newFeatures.length > 0) {
               comment += `### ✨ New Features\n`;
               analysis.newFeatures.forEach(feature => {
@@ -166,7 +235,7 @@ jobs:
               });
               comment += '\n';
             }
-            
+
             if (analysis.bugFixes && analysis.bugFixes.length > 0) {
               comment += `### 🐛 Bug Fixes & Improvements\n`;
               analysis.bugFixes.forEach(fix => {
@@ -174,7 +243,12 @@ jobs:
               });
               comment += '\n';
             }
-            
+
+            comment += `### 📦 Updated Files\n`;
+            comment += `- \`gradle.properties\`: version bumped to \`${newVersion}-SNAPSHOT\`\n`;
+            comment += `- \`ballerina/Ballerina.toml\`: version bumped to \`${newVersion}\`\n`;
+            comment += `- \`ballerina/Dependencies.toml\`: regenerated via \`bal build\`\n\n`;
+
             // Add interpretation guide
             comment += `---\n`;
             comment += `<details>\n`;
@@ -183,12 +257,12 @@ jobs:
             comment += `- **MINOR (🟡)**: New features added in a backward-compatible manner\n`;
             comment += `- **PATCH (🟢)**: Bug fixes and improvements with no API changes\n`;
             comment += `\n`;
-            comment += `*This analysis was performed using multi-turn AI analysis with the complete diff content sent in chunks.*\n`;
+            comment += `*Version files have been automatically updated and committed.*\n`;
             comment += `</details>\n`;
-            
+
             // Post comment to PR
             const prNumber = context.payload.client_payload?.pr_number;
-            
+
             if (prNumber) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
@@ -202,7 +276,7 @@ jobs:
               console.log('Comment that would have been posted:');
               console.log(comment);
             }
-      
+
       - name: Set job summary
         if: always() && steps.diff.outputs.has_changes == 'true'
         run: |
@@ -210,13 +284,19 @@ jobs:
             CHANGE_TYPE=$(jq -r '.changeType' analysis_result.json)
             CONFIDENCE=$(jq -r '.confidence' analysis_result.json)
             SUMMARY=$(jq -r '.summary' analysis_result.json)
-            
-            echo "## 📊 Version Change Analysis (Multi-Turn)" >> $GITHUB_STEP_SUMMARY
+            NEW_VERSION="${{ steps.version_bump.outputs.new_version }}"
+
+            echo "## 📊 Version Change Analysis" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Recommended Version Bump:** \`$CHANGE_TYPE\`" >> $GITHUB_STEP_SUMMARY
+            echo "**New Version:** \`$NEW_VERSION\`" >> $GITHUB_STEP_SUMMARY
             echo "**Confidence:** $CONFIDENCE" >> $GITHUB_STEP_SUMMARY
-            echo "**Analysis Method:** Complete diff analyzed using multi-turn conversation" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### Summary" >> $GITHUB_STEP_SUMMARY
             echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Updated Files" >> $GITHUB_STEP_SUMMARY
+            echo "- \`gradle.properties\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`ballerina/Ballerina.toml\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`ballerina/Dependencies.toml\`" >> $GITHUB_STEP_SUMMARY
           fi
