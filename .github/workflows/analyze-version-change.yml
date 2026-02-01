@@ -56,6 +56,15 @@ jobs:
         with:
           version: latest
 
+      - name: Verify files
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          echo "📁 Checking required files..."
+          ls -lh analyze_version_change.bal git_diff.txt
+          echo ""
+          echo "🔍 Testing Ballerina compilation..."
+          bal build analyze_version_change.bal || echo "⚠️ Build failed but will try to run"
+
       - name: Run multi-turn analysis
         if: steps.diff.outputs.has_changes == 'true'
         env:
@@ -67,7 +76,17 @@ jobs:
           echo "   - Lines: ${{ steps.diff.outputs.diff_lines }}"
           echo ""
 
+          # Run analysis
           bal run analyze_version_change.bal -- "git_diff.txt"
+
+          # Check if analysis result was created
+          if [ ! -f analysis_result.json ]; then
+            echo "❌ Analysis failed - analysis_result.json not found"
+            exit 1
+          fi
+
+          echo "✅ Analysis completed successfully"
+          cat analysis_result.json
 
       - name: Update version files
         if: steps.diff.outputs.has_changes == 'true'
