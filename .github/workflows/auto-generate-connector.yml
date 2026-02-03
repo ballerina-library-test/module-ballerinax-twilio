@@ -12,8 +12,9 @@ jobs:
     secrets: inherit
     with:
       openapi-url: ${{ github.event.client_payload.openapi_url }}
-      
+
       distribution-zip: ""
       license-file: "license.txt"
       quiet-mode: false
-      skip-to-doc: true
+
+      regenerate-existing: true
