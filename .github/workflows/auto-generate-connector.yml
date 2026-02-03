@@ -17,4 +17,4 @@ jobs:
       license-file: "license.txt"
       quiet-mode: false
 
-      regenerate-existing: true
+
